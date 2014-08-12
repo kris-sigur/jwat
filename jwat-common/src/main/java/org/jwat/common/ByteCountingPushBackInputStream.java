@@ -40,6 +40,12 @@ public class ByteCountingPushBackInputStream extends PushbackInputStream {
 
     /** Byte counter which can also be changed. */
     protected long counter = 0;
+    
+    // First 'pushback_size' bytes are reserved for the pushback buffer, the rest are for read ahead buffer
+    protected byte[] buf; 
+    protected int bufPos; // Position in buf of next byte to read
+    protected int bufLen; // Position in buf of the last byte to read +1
+    protected boolean underlyingEmpty;
 
     /**
      * Given an <code>InputStream</code> and a push back buffer size returns
@@ -48,8 +54,12 @@ public class ByteCountingPushBackInputStream extends PushbackInputStream {
      * @param size push back buffer size
      */
     public ByteCountingPushBackInputStream(InputStream in, int size) {
-        super(in, size);
+        super(in, 1); // We dont actually use the underlying buffer
         pushback_size = size;
+        buf = new byte[pushback_size+10000];
+        bufPos = pushback_size;
+        bufLen = pushback_size;
+        underlyingEmpty=false;
     }
 
     /**
@@ -101,12 +111,15 @@ public class ByteCountingPushBackInputStream extends PushbackInputStream {
 
     @Override
     public int read() throws IOException {
-        int b = super.read();
-        if (b != -1) {
-            ++consumed;
-            ++counter;
-        }
-        return b;
+    	while (bufPos>=bufLen && !underlyingEmpty) {
+    		fillBuffer();
+    	}
+    	if (underlyingEmpty) {
+    		return -1;
+    	}
+    	consumed++;
+    	counter++;
+    	return buf[bufPos++] & 0xff;
     }
 
     /*
@@ -119,19 +132,55 @@ public class ByteCountingPushBackInputStream extends PushbackInputStream {
         return read(b, 0, b.length);
     }
 
+    protected void fillBuffer() throws IOException {
+    	if (bufPos<bufLen) {
+   			throw new IllegalStateException("Internal buffer not exhausted yet");
+    	}
+    	bufPos = pushback_size;
+    	int read = super.read(buf,pushback_size,buf.length-pushback_size);
+    	bufLen = bufPos + read;
+    	underlyingEmpty = read==-1;
+    }
+    
     @Override
     public int read(byte[] b, int off, int len) throws IOException {
-        int bytesRead = super.read(b, off, len);
-        if (bytesRead > 0) {
-            consumed += bytesRead;
-            counter += bytesRead;
-        }
+    	if (bufPos>=bufLen) {
+    		fillBuffer();
+        	if (underlyingEmpty) {
+        		return -1;
+        	}
+    	}
+    	int bytesRead = -1; 
+		int leftInBuffer = bufLen-bufPos;
+    	if (bufLen<0) {
+    		bytesRead = -1;
+    	} else {
+    		// Return what is in the buffer up to len or end of buffer
+    		bytesRead = Math.min(leftInBuffer, len);
+    		System.arraycopy(buf, bufPos, b, off, bytesRead);
+    		bufPos+=bytesRead;
+    	} 
+    	consumed+=bytesRead;
+    	counter+=bytesRead;
         return bytesRead;
     }
 
     @Override
     public long skip(long n) throws IOException {
-        long bytesSkipped = super.skip(n);
+		int bytesInBuffer = bufLen-bufPos;
+    	long bytesSkipped = 0;
+		if (n<bytesInBuffer) {
+			bufPos+=n;
+			bytesSkipped=n;
+		} else if (bytesInBuffer<0) {
+			bytesSkipped+=super.skip(n); 
+		} else {
+			long skipUnderlying = n-bytesInBuffer;
+			bufPos = bufLen;
+			bytesSkipped = bytesInBuffer;
+			//We've exhausted the buffer at this point, so can go straight to underlying stream for the rest
+			bytesSkipped+=super.skip(skipUnderlying); 
+		}
         consumed += bytesSkipped;
         counter += bytesSkipped;
         return bytesSkipped;
@@ -139,9 +188,13 @@ public class ByteCountingPushBackInputStream extends PushbackInputStream {
 
     @Override
     public void unread(int b) throws IOException {
-        super.unread(b);
-        --consumed;
-        --counter;
+    	if (bufPos==0) {
+            throw new IOException("Push back buffer too small");
+    	}
+   		// Back up in the buffer to make space for the unread byte
+        buf[--bufPos]=(byte)b;
+        consumed--;
+        counter--;
     }
 
     /*
@@ -156,7 +209,11 @@ public class ByteCountingPushBackInputStream extends PushbackInputStream {
 
     @Override
     public void unread(byte[] b, int off, int len) throws IOException {
-        super.unread(b, off, len);
+    	if (len > bufPos) {
+            throw new IOException("Push back buffer too small");
+    	}
+   		bufPos=bufPos-len; // Back up enough in the buffer to make space for the unread bytes
+        System.arraycopy(b, off, buf, bufPos, len);
         consumed -= len;
         counter -= len;
     }
